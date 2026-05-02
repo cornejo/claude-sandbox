@@ -25,6 +25,7 @@ SYSTEM_RO_BINDS: list[str] = [
     "/etc/resolv.conf",
     "/etc/hosts",
     "/etc/ssl",
+    "/etc/ca-certificates",
     "/etc/passwd",
     "/etc/group",
 ]
