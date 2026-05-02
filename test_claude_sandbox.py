@@ -131,6 +131,16 @@ class TestResolvePath:
         assert not result.startswith("~")
         assert result.endswith("/foo")
 
+    def test_expands_env_vars(self):
+        with patch.dict(os.environ, {"HOME": "/home/testuser"}):
+            result = cs.resolve_path("$HOME/data")
+            assert result == "/home/testuser/data"
+
+    def test_expands_env_vars_braced(self):
+        with patch.dict(os.environ, {"MY_DIR": "/opt/tools"}):
+            result = cs.resolve_path("${MY_DIR}/bin")
+            assert result == "/opt/tools/bin"
+
     def test_normalizes_dotdot(self):
         result = cs.resolve_path("/a/b/../c")
         assert result == "/a/c"
@@ -177,7 +187,7 @@ class TestCreateFilteredClaudeConfig:
             },
             "otherKey": "preserved",
         }
-        path = cs.create_filtered_claude_config(config, ["ghidra", "oracle"], verbose=False)
+        path = cs.create_filtered_claude_config(config, ["ghidra", "oracle"], Path("/tmp/project"), verbose=False)
         try:
             with open(path) as f:
                 result = json.load(f)
@@ -186,9 +196,36 @@ class TestCreateFilteredClaudeConfig:
         finally:
             os.unlink(path)
 
+    def test_injects_trust_for_project(self):
+        config = {"mcpServers": {}}
+        path = cs.create_filtered_claude_config(config, [], Path("/tmp/my-project"), verbose=False)
+        try:
+            with open(path) as f:
+                result = json.load(f)
+            assert result["projects"]["/tmp/my-project"]["hasTrustDialogAccepted"] is True
+        finally:
+            os.unlink(path)
+
+    def test_preserves_existing_project_trust(self):
+        config = {
+            "mcpServers": {},
+            "projects": {
+                "/tmp/my-project": {"allowedTools": ["Bash"], "hasTrustDialogAccepted": False},
+            },
+        }
+        path = cs.create_filtered_claude_config(config, [], Path("/tmp/my-project"), verbose=False)
+        try:
+            with open(path) as f:
+                result = json.load(f)
+            entry = result["projects"]["/tmp/my-project"]
+            assert entry["hasTrustDialogAccepted"] is True
+            assert entry["allowedTools"] == ["Bash"]
+        finally:
+            os.unlink(path)
+
     def test_no_enabled_mcps_strips_all(self):
         config = {"mcpServers": {"ghidra": {"command": "x"}}}
-        path = cs.create_filtered_claude_config(config, [], verbose=False)
+        path = cs.create_filtered_claude_config(config, [], Path("/tmp/project"), verbose=False)
         try:
             with open(path) as f:
                 result = json.load(f)
