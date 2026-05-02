@@ -15,7 +15,7 @@ Claude gets full write access to your project directory and its own config, but 
 
 ```bash
 # Clone and symlink into PATH
-git clone https://github.com/youruser/claude-sandbox.git
+git clone https://github.com/cornejo/claude-sandbox.git
 ln -s "$(pwd)/claude-sandbox/claude-sandbox" ~/.local/bin/claude-sandbox
 ```
 
@@ -171,4 +171,4 @@ claude-sandbox --dry-run --verbose -p "review the code"
 
 ## License
 
-MIT
+GPL v3

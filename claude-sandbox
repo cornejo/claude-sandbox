@@ -25,6 +25,7 @@ SYSTEM_RO_BINDS: list[str] = [
     "/etc/resolv.conf",
     "/etc/hosts",
     "/etc/ssl",
+    "/etc/ca-certificates",
     "/etc/passwd",
     "/etc/group",
 ]
@@ -251,6 +252,8 @@ def build_bwrap_command(
     global_config: SandboxConfig,
     global_mcps: dict[str, McpDefinition],
     project_config: SandboxConfig,
+    project_raw_provided: bool,
+    enabled_mcps: list[str],
     claude_config: dict[str, Any],
     claude_args: list[str],
     verbose: bool,
@@ -291,7 +294,6 @@ def build_bwrap_command(
             registry.add(str(claude_json), str(claude_json), BindMode.RW, "claude")
 
     # Layer 4: MCP definitions (from global config)
-    enabled_mcps: list[str] = project_config.mcp if project_config.mcp else global_config.mcp
     env_patterns: list[str] = []
 
     for mcp_name in enabled_mcps:
@@ -392,13 +394,13 @@ def build_bwrap_command(
     args += ["--proc", "/proc"]
     args += ["--dev", "/dev"]
 
-    network: bool = project_config.network and global_config.network
+    network: bool = project_config.network if project_raw_provided else global_config.network
     if network:
         args += ["--share-net"]
     else:
         args += ["--unshare-net"]
 
-    share_pid: bool = project_config.share_pid or global_config.share_pid
+    share_pid: bool = project_config.share_pid if project_raw_provided else global_config.share_pid
     if not share_pid:
         args += ["--unshare-pid"]
 
@@ -466,8 +468,11 @@ def main() -> None:
             claude_config, enabled_mcps, verbose
         )
 
+    project_raw_provided: bool = bool(project_raw)
+
     bwrap_args: list[str] = build_bwrap_command(
         project_dir, global_config, global_mcps, project_config,
+        project_raw_provided, enabled_mcps,
         claude_config, claude_args, verbose, filtered_config_path,
     )
 
