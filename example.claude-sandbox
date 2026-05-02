@@ -12,12 +12,7 @@ pass_env = ["ANTHROPIC_*"]
 
 [[mcp]]
 name = "ghidra"
-ro_bind = ["/home/ejcorne/ghidra"]
+ro_bind = ["$HOME/ghidra"]
 rw_bind = []
 pass_env = ["GHIDRA_*"]
 
-[[mcp]]
-name = "mcp-oracle"
-ro_bind = ["/home/ejcorne/code/github/mcp-oracle"]
-rw_bind = []
-pass_env = []
