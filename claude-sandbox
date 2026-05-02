@@ -135,7 +135,7 @@ def parse_mcp_definitions(raw: dict[str, Any]) -> dict[str, McpDefinition]:
 
 
 def resolve_path(p: str) -> str:
-    return os.path.normpath(os.path.expanduser(p))
+    return os.path.normpath(os.path.expandvars(os.path.expanduser(p)))
 
 
 def resolve_mcp_paths(name: str, claude_config: dict[str, Any]) -> list[str]:
@@ -206,9 +206,11 @@ def is_under_system_bind(path: str) -> bool:
 def create_filtered_claude_config(
     claude_config: dict[str, Any],
     enabled_mcps: list[str],
+    project_dir: Path,
     verbose: bool,
 ) -> str:
-    """Write a filtered ~/.claude.json that only includes enabled MCPs.
+    """Write a filtered ~/.claude.json that only includes enabled MCPs
+    and marks the project directory as trusted.
     Returns the path to the temp file."""
     filtered: dict[str, Any] = dict(claude_config)
     original_servers: dict[str, Any] = filtered.get("mcpServers", {})
@@ -227,6 +229,10 @@ def create_filtered_claude_config(
         print(f"verbose: stripped MCPs from config: {', '.join(sorted(removed))}", file=sys.stderr)
 
     filtered["mcpServers"] = filtered_servers
+
+    projects: dict[str, Any] = filtered.setdefault("projects", {})
+    project_entry: dict[str, Any] = projects.setdefault(str(project_dir), {})
+    project_entry["hasTrustDialogAccepted"] = True
 
     fd: int
     tmp_path: str
@@ -465,7 +471,7 @@ def main() -> None:
     filtered_config_path: str | None = None
     if claude_json_path.exists():
         filtered_config_path = create_filtered_claude_config(
-            claude_config, enabled_mcps, verbose
+            claude_config, enabled_mcps, project_dir, verbose
         )
 
     project_raw_provided: bool = bool(project_raw)
