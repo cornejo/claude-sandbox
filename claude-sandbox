@@ -1,0 +1,482 @@
+#!/usr/bin/env python3
+"""Launch claude inside a bubblewrap sandbox at the current directory."""
+
+import atexit
+import fnmatch
+import json
+import os
+import shutil
+import sys
+import tempfile
+import tomllib
+from dataclasses import dataclass, field
+from enum import Enum
+from pathlib import Path
+from typing import Any
+
+SANDBOX_FILE: str = ".sandbox"
+GLOBAL_CONFIG_FILE: str = ".claude-sandbox"
+
+SYSTEM_RO_BINDS: list[str] = [
+    "/usr",
+    "/bin",
+    "/lib",
+    "/lib64",
+    "/etc/resolv.conf",
+    "/etc/hosts",
+    "/etc/ssl",
+    "/etc/passwd",
+    "/etc/group",
+]
+
+HOME_RO_BINDS: list[str] = [
+    ".gitconfig",
+    ".nvm",
+]
+
+
+class BindMode(Enum):
+    RO = "ro"
+    RW = "rw"
+    NULL = "null"
+
+
+@dataclass
+class BindEntry:
+    source: str
+    target: str
+    mode: BindMode
+    origin: str
+
+
+@dataclass
+class MountRegistry:
+    entries: dict[str, BindEntry] = field(default_factory=dict)
+    collisions: list[str] = field(default_factory=list)
+
+    def add(self, source: str, target: str, mode: BindMode, origin: str) -> None:
+        existing: BindEntry | None = self.entries.get(target)
+        if existing is not None and existing.mode != mode:
+            self.collisions.append(
+                f"  {target}: {existing.mode.value} ({existing.origin}) "
+                f"-> {mode.value} ({origin})"
+            )
+        self.entries[target] = BindEntry(
+            source=source, target=target, mode=mode, origin=origin
+        )
+
+    def to_bwrap_args(self) -> list[str]:
+        args: list[str] = []
+        for entry in self.entries.values():
+            if entry.mode == BindMode.RO:
+                args += ["--ro-bind", entry.source, entry.target]
+            elif entry.mode == BindMode.RW:
+                args += ["--bind", entry.source, entry.target]
+            elif entry.mode == BindMode.NULL:
+                args += ["--ro-bind", "/dev/null", entry.target]
+        return args
+
+
+@dataclass
+class McpDefinition:
+    name: str
+    ro_bind: list[str] = field(default_factory=list)
+    rw_bind: list[str] = field(default_factory=list)
+    pass_env: list[str] = field(default_factory=list)
+
+
+@dataclass
+class SandboxConfig:
+    network: bool = True
+    share_pid: bool = False
+    ro_bind: list[str] = field(default_factory=list)
+    rw_bind: list[str] = field(default_factory=list)
+    null_files: list[str] = field(default_factory=lambda: [
+        ".env", ".env.local", ".env.production"
+    ])
+    pass_env: list[str] = field(default_factory=list)
+    mcp: list[str] = field(default_factory=list)
+
+
+def load_toml_config(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    with open(path, "rb") as f:
+        return tomllib.load(f)
+
+
+def parse_sandbox_config(raw: dict[str, Any]) -> SandboxConfig:
+    config: SandboxConfig = SandboxConfig()
+    if "network" in raw:
+        config.network = bool(raw["network"])
+    if "share_pid" in raw:
+        config.share_pid = bool(raw["share_pid"])
+    for key in ("ro_bind", "rw_bind", "null_files", "pass_env", "mcp"):
+        if key in raw:
+            val: Any = raw[key]
+            setattr(config, key, [str(v) for v in val] if isinstance(val, list) else [str(val)])
+    return config
+
+
+def parse_mcp_definitions(raw: dict[str, Any]) -> dict[str, McpDefinition]:
+    mcps: dict[str, McpDefinition] = {}
+    for entry in raw.get("mcp", []):
+        if not isinstance(entry, dict) or "name" not in entry:
+            continue
+        name: str = entry["name"]
+        mcps[name] = McpDefinition(
+            name=name,
+            ro_bind=[str(v) for v in entry.get("ro_bind", [])],
+            rw_bind=[str(v) for v in entry.get("rw_bind", [])],
+            pass_env=[str(v) for v in entry.get("pass_env", [])],
+        )
+    return mcps
+
+
+def resolve_path(p: str) -> str:
+    return os.path.normpath(os.path.expanduser(p))
+
+
+def resolve_mcp_paths(name: str, claude_config: dict[str, Any]) -> list[str]:
+    """Extract filesystem paths from an MCP server's claude config."""
+    mcp_servers: dict[str, Any] = claude_config.get("mcpServers", {})
+    server: dict[str, Any] | None = mcp_servers.get(name)
+    if server is None:
+        return []
+
+    paths: list[str] = []
+    command: str = server.get("command", "")
+    command_path: str | None = shutil.which(command)
+    if command_path:
+        paths.append(os.path.dirname(command_path))
+
+    for arg in server.get("args", []):
+        expanded: str = resolve_path(arg)
+        if os.path.exists(expanded):
+            if os.path.isfile(expanded):
+                paths.append(os.path.dirname(expanded))
+            else:
+                paths.append(expanded)
+        elif os.path.exists(os.path.dirname(expanded)):
+            paths.append(os.path.dirname(expanded))
+
+    return paths
+
+
+def resolve_claude_binary() -> tuple[str, list[str]]:
+    """Resolve claude binary without following home directory symlinks.
+    Returns (exec_path, paths_to_bind)."""
+    claude_bin: str | None = shutil.which("claude")
+    if not claude_bin:
+        print("error: 'claude' not found in PATH", file=sys.stderr)
+        sys.exit(1)
+
+    paths: list[str] = []
+
+    bin_dir: str = os.path.dirname(claude_bin)
+    paths.append(bin_dir)
+
+    # Walk the symlink chain using normpath (not realpath) to preserve
+    # logical paths like /home/user even when they're symlinks
+    current: str = claude_bin
+    while os.path.islink(current):
+        target: str = os.readlink(current)
+        if not os.path.isabs(target):
+            target = os.path.join(os.path.dirname(current), target)
+        target = os.path.normpath(target)
+        paths.append(target)
+        current = target
+
+    exec_path: str = current
+    if not os.path.exists(exec_path):
+        print(f"error: claude resolves to {exec_path} which does not exist", file=sys.stderr)
+        sys.exit(1)
+
+    return exec_path, paths
+
+
+def is_under_system_bind(path: str) -> bool:
+    return any(
+        path.startswith(bound + "/") or path == bound
+        for bound in SYSTEM_RO_BINDS
+    )
+
+
+def create_filtered_claude_config(
+    claude_config: dict[str, Any],
+    enabled_mcps: list[str],
+    verbose: bool,
+) -> str:
+    """Write a filtered ~/.claude.json that only includes enabled MCPs.
+    Returns the path to the temp file."""
+    filtered: dict[str, Any] = dict(claude_config)
+    original_servers: dict[str, Any] = filtered.get("mcpServers", {})
+
+    if enabled_mcps:
+        filtered_servers: dict[str, Any] = {
+            name: config
+            for name, config in original_servers.items()
+            if name in enabled_mcps
+        }
+    else:
+        filtered_servers = {}
+
+    removed: set[str] = set(original_servers.keys()) - set(filtered_servers.keys())
+    if removed and verbose:
+        print(f"verbose: stripped MCPs from config: {', '.join(sorted(removed))}", file=sys.stderr)
+
+    filtered["mcpServers"] = filtered_servers
+
+    fd: int
+    tmp_path: str
+    fd, tmp_path = tempfile.mkstemp(prefix="claude-sandbox-", suffix=".json")
+    with os.fdopen(fd, "w") as f:
+        json.dump(filtered, f, indent=2)
+
+    atexit.register(lambda: os.unlink(tmp_path) if os.path.exists(tmp_path) else None)
+    return tmp_path
+
+
+def resolve_env_globs(patterns: list[str]) -> set[str]:
+    matched: set[str] = set()
+    for pattern in patterns:
+        for var in os.environ:
+            if fnmatch.fnmatch(var, pattern):
+                matched.add(var)
+    return matched
+
+
+def build_bwrap_command(
+    project_dir: Path,
+    global_config: SandboxConfig,
+    global_mcps: dict[str, McpDefinition],
+    project_config: SandboxConfig,
+    claude_config: dict[str, Any],
+    claude_args: list[str],
+    verbose: bool,
+    filtered_config_path: str | None,
+) -> list[str]:
+    home: Path = Path.home()
+    registry: MountRegistry = MountRegistry()
+
+    # Layer 1: system paths
+    for path in SYSTEM_RO_BINDS:
+        if os.path.exists(path):
+            registry.add(path, path, BindMode.RO, "system")
+
+    for name in HOME_RO_BINDS:
+        src: Path = home / name
+        if src.exists():
+            registry.add(str(src), str(src), BindMode.RO, "system")
+
+    # Layer 2: claude binary (bind each file in the symlink chain individually)
+    claude_bin: str
+    claude_chain: list[str]
+    claude_bin, claude_chain = resolve_claude_binary()
+
+    for p in claude_chain:
+        if not is_under_system_bind(p):
+            registry.add(p, p, BindMode.RO, "claude")
+
+    # Layer 3: claude config paths
+    claude_dir: Path = home / ".claude"
+    claude_dir.mkdir(exist_ok=True)
+    registry.add(str(claude_dir), str(claude_dir), BindMode.RW, "claude")
+
+    claude_json: Path = home / ".claude.json"
+    if claude_json.exists():
+        if filtered_config_path:
+            registry.add(filtered_config_path, str(claude_json), BindMode.RW, "claude(filtered)")
+        else:
+            registry.add(str(claude_json), str(claude_json), BindMode.RW, "claude")
+
+    # Layer 4: MCP definitions (from global config)
+    enabled_mcps: list[str] = project_config.mcp if project_config.mcp else global_config.mcp
+    env_patterns: list[str] = []
+
+    for mcp_name in enabled_mcps:
+        mcp_def: McpDefinition | None = global_mcps.get(mcp_name)
+        origin: str = f"mcp:{mcp_name}"
+
+        auto_paths: list[str] = resolve_mcp_paths(mcp_name, claude_config)
+        for p in auto_paths:
+            if not is_under_system_bind(p):
+                registry.add(p, p, BindMode.RO, f"{origin}(auto)")
+
+        if mcp_def:
+            for p in mcp_def.ro_bind:
+                resolved: str = resolve_path(p)
+                if os.path.exists(resolved):
+                    registry.add(resolved, resolved, BindMode.RO, origin)
+                elif verbose:
+                    print(f"verbose: {origin} ro_bind not found: {p}", file=sys.stderr)
+
+            for p in mcp_def.rw_bind:
+                resolved = resolve_path(p)
+                if os.path.exists(resolved):
+                    registry.add(resolved, resolved, BindMode.RW, origin)
+                elif verbose:
+                    print(f"verbose: {origin} rw_bind not found: {p}", file=sys.stderr)
+
+            env_patterns.extend(mcp_def.pass_env)
+        elif verbose:
+            print(
+                f"verbose: mcp '{mcp_name}' enabled but not defined in "
+                f"~/{GLOBAL_CONFIG_FILE}",
+                file=sys.stderr,
+            )
+
+    # Layer 5: global config binds
+    for p in global_config.ro_bind:
+        resolved = resolve_path(p)
+        if os.path.exists(resolved):
+            registry.add(resolved, resolved, BindMode.RO, "global")
+        else:
+            print(f"warning: global ro_bind not found: {p}", file=sys.stderr)
+
+    for p in global_config.rw_bind:
+        resolved = resolve_path(p)
+        if os.path.exists(resolved):
+            registry.add(resolved, resolved, BindMode.RW, "global")
+        else:
+            print(f"warning: global rw_bind not found: {p}", file=sys.stderr)
+
+    env_patterns.extend(global_config.pass_env)
+
+    # Layer 6: project directory (rw) and project config overrides
+    registry.add(str(project_dir), str(project_dir), BindMode.RW, "project")
+
+    for p in project_config.ro_bind:
+        resolved = resolve_path(p)
+        if os.path.exists(resolved):
+            registry.add(resolved, resolved, BindMode.RO, "project")
+        else:
+            print(f"warning: project ro_bind not found: {p}", file=sys.stderr)
+
+    for p in project_config.rw_bind:
+        resolved = resolve_path(p)
+        if os.path.exists(resolved):
+            registry.add(resolved, resolved, BindMode.RW, "project")
+        else:
+            print(f"warning: project rw_bind not found: {p}", file=sys.stderr)
+
+    for name in project_config.null_files:
+        target: Path = project_dir / name
+        if target.exists() or target.is_symlink():
+            registry.add("/dev/null", str(target), BindMode.NULL, "project")
+
+    sandbox_path: Path = project_dir / SANDBOX_FILE
+    if sandbox_path.exists():
+        registry.add(str(sandbox_path), str(sandbox_path), BindMode.RO, "project(protect)")
+
+    env_patterns.extend(project_config.pass_env)
+
+    # Report collisions
+    if registry.collisions:
+        if verbose:
+            print("verbose: mount collisions (later layer wins):", file=sys.stderr)
+            for msg in registry.collisions:
+                print(msg, file=sys.stderr)
+        elif any("rw" in c and "ro" in c for c in registry.collisions):
+            print(
+                f"info: {len(registry.collisions)} mount collision(s) detected, "
+                f"use --verbose for details",
+                file=sys.stderr,
+            )
+
+    # Build final bwrap command
+    args: list[str] = ["bwrap"]
+    args.extend(registry.to_bwrap_args())
+
+    args += ["--tmpfs", "/tmp"]
+    args += ["--proc", "/proc"]
+    args += ["--dev", "/dev"]
+
+    network: bool = project_config.network and global_config.network
+    if network:
+        args += ["--share-net"]
+    else:
+        args += ["--unshare-net"]
+
+    share_pid: bool = project_config.share_pid or global_config.share_pid
+    if not share_pid:
+        args += ["--unshare-pid"]
+
+    args += ["--die-with-parent"]
+    args += ["--chdir", str(project_dir)]
+
+    matched_vars: set[str] = resolve_env_globs(env_patterns)
+    for var in sorted(matched_vars):
+        args += ["--setenv", var, os.environ[var]]
+
+    if verbose:
+        print(f"verbose: sandbox mounts ({len(registry.entries)}):", file=sys.stderr)
+        for entry in registry.entries.values():
+            src_display: str = entry.source if entry.source != entry.target else ""
+            print(
+                f"  {entry.mode.value:4s} {entry.target}"
+                f"{' <- ' + src_display if src_display else ''}"
+                f"  [{entry.origin}]",
+                file=sys.stderr,
+            )
+        print(f"verbose: network={'yes' if network else 'no'}, "
+              f"pid_isolated={'no' if share_pid else 'yes'}", file=sys.stderr)
+        if matched_vars:
+            print(f"verbose: env vars: {', '.join(sorted(matched_vars))}", file=sys.stderr)
+
+    args.append(claude_bin)
+    args.append("--dangerously-skip-permissions")
+    args.extend(claude_args)
+
+    return args
+
+
+def main() -> None:
+    project_dir: Path = Path(os.getcwd())
+    home: Path = Path.home()
+
+    verbose: bool = "--verbose" in sys.argv
+    dry_run: bool = "--dry-run" in sys.argv
+    strip_flags: set[str] = {"--verbose", "--dry-run"}
+    claude_args: list[str] = [a for a in sys.argv[1:] if a not in strip_flags]
+
+    # Load global config (~/.claude-sandbox)
+    global_raw: dict[str, Any] = load_toml_config(home / GLOBAL_CONFIG_FILE)
+    global_config: SandboxConfig = parse_sandbox_config(global_raw)
+    global_mcps: dict[str, McpDefinition] = parse_mcp_definitions(global_raw)
+
+    # Load project config (.sandbox)
+    project_raw: dict[str, Any] = load_toml_config(project_dir / SANDBOX_FILE)
+    project_config: SandboxConfig = parse_sandbox_config(project_raw)
+
+    # Load claude's MCP config
+    claude_config: dict[str, Any] = {}
+    claude_json_path: Path = home / ".claude.json"
+    if claude_json_path.exists():
+        with open(claude_json_path) as f:
+            claude_config = json.load(f)
+
+    # Determine enabled MCPs: project overrides global, default is none
+    enabled_mcps: list[str] = project_config.mcp if project_config.mcp else global_config.mcp
+
+    # Create filtered claude config with only enabled MCPs
+    filtered_config_path: str | None = None
+    if claude_json_path.exists():
+        filtered_config_path = create_filtered_claude_config(
+            claude_config, enabled_mcps, verbose
+        )
+
+    bwrap_args: list[str] = build_bwrap_command(
+        project_dir, global_config, global_mcps, project_config,
+        claude_config, claude_args, verbose, filtered_config_path,
+    )
+
+    if dry_run:
+        print(" \\\n  ".join(bwrap_args))
+        return
+
+    os.execvp("bwrap", bwrap_args)
+
+
+if __name__ == "__main__":
+    main()
