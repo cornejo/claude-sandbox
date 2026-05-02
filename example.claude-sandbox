@@ -1,0 +1,18 @@
+# ~/.claude-sandbox — global sandbox config
+# Defines MCP server resource requirements and global defaults.
+
+# Global defaults (project .sandbox can override)
+network = true
+share_pid = false
+pass_env = ["ANTHROPIC_*"]
+
+# MCP server definitions
+# Each [[mcp]] block declares what an MCP server needs to function.
+# These are applied first; project .sandbox overrides take precedence.
+
+[[mcp]]
+name = "ghidra"
+ro_bind = ["$HOME/ghidra"]
+rw_bind = []
+pass_env = ["GHIDRA_*"]
+

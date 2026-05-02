@@ -1,0 +1,20 @@
+# .sandbox — project-level sandbox config
+# Place at the root of your project directory.
+# Overrides global ~/.claude-sandbox and MCP definitions (last layer wins).
+
+# Sandbox options
+network = true
+share_pid = false
+
+# Which MCPs to enable for this project (references ~/.claude-sandbox definitions)
+mcp = ["ghidra", "mcp-oracle"]
+
+# Extra paths (beyond project dir)
+ro_bind = []
+rw_bind = []
+
+# Files inside the project to replace with /dev/null
+null_files = [".env", ".env.local", ".env.production"]
+
+# Environment variables to pass in (supports globs)
+pass_env = ["GITHUB_*", "SSH_AUTH_SOCK"]
